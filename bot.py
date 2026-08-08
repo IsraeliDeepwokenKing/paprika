@@ -19,7 +19,7 @@ load_dotenv()
 DB_PATH = Path("data/deepwoken_bot.db")
 REGIONS = ["NA", "EU", "SA", "Asia", "Oceania"]
 TICKET_TYPES = {"pve": "PvE Application", "tryout": "Tryout Application", "help": "General Help"}
-BOT_CHANNELS = ["carry-pings", "gank-pings", "application-reviews", "tickets", "reactions", "giveaways", "bot-logs", "version", "update-log"]
+BOT_CHANNELS = ["carry-pings", "gank-pings", "application-reviews", "tickets", "reactions", "giveaways", "bot-logs", "version", "update-log", "leaderboard"]
 OLD_BOSS_PINGS = ["Enmity Ping", "Elder Ping", "Titus Ping"]
 CARRY_BOSSES = {"Enmity": 16, "Elder": 16, "Titus": 6}
 BOT_VERSION = "v2.0.0 — ENMITY"
@@ -43,9 +43,11 @@ class Store:
         CREATE TABLE IF NOT EXISTS raid_lockdowns (guild_id INTEGER, channel_id INTEGER, prior_send_messages INTEGER, PRIMARY KEY(guild_id, channel_id));
         CREATE TABLE IF NOT EXISTS ganks (gank_id TEXT PRIMARY KEY, message_id INTEGER, guild_id INTEGER, host_id INTEGER, region TEXT, target TEXT, joined TEXT DEFAULT '', stage_id INTEGER, role_id INTEGER, created_at INTEGER);
         CREATE TABLE IF NOT EXISTS pvp_points (guild_id INTEGER, user_id INTEGER, month TEXT, points INTEGER DEFAULT 0, PRIMARY KEY(guild_id, user_id, month));
+        CREATE TABLE IF NOT EXISTS pve_points (guild_id INTEGER, user_id INTEGER, points INTEGER DEFAULT 0, PRIMARY KEY(guild_id, user_id));
         CREATE TABLE IF NOT EXISTS host_vouches (guild_id INTEGER, host_id INTEGER, voucher_id INTEGER, month TEXT, PRIMARY KEY(guild_id, host_id, voucher_id, month));
         CREATE TABLE IF NOT EXISTS monthly_awards (guild_id INTEGER, month TEXT, pvp_winner_id INTEGER, host_winner_id INTEGER, PRIMARY KEY(guild_id, month));
         CREATE TABLE IF NOT EXISTS release_announcements (guild_id INTEGER, version TEXT, PRIMARY KEY(guild_id, version));
+        CREATE TABLE IF NOT EXISTS leaderboard_messages (guild_id INTEGER PRIMARY KEY, channel_id INTEGER, message_id INTEGER);
         """)
         self._add_column("carries", "carry_id", "TEXT")
         self._add_column("carries", "waiting", "TEXT DEFAULT ''")
@@ -408,6 +410,7 @@ async def endgank(interaction: discord.Interaction, gank_id: str):
     if post and row["message_id"]:
         try: await post.get_partial_message(row["message_id"]).delete()
         except discord.HTTPException: pass
+    await update_leaderboard(interaction.guild)
     await interaction.response.send_message(f"Gank `{row['gank_id']}` ended. {len(participants)} participant(s) received 1 PvP point.", ephemeral=True)
 
 
@@ -425,6 +428,46 @@ async def vouch(interaction: discord.Interaction, hoster: discord.Member):
         return await interaction.response.send_message("You have already vouched for that hoster this month.", ephemeral=True)
     total = store.db.execute("SELECT COUNT(*) FROM host_vouches WHERE guild_id=? AND host_id=? AND month=?", (interaction.guild.id, hoster.id, month_key())).fetchone()[0]
     await interaction.response.send_message(f"Vouch recorded for {hoster.mention}. They now have {total} vouch(es) this month.", ephemeral=True)
+
+
+def leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    pve_scores = {row["user_id"]: row["points"] for row in store.db.execute("SELECT user_id, points FROM pve_points WHERE guild_id=?", (guild.id,))}
+    pvp_scores = {row["user_id"]: row["points"] for row in store.db.execute("SELECT user_id, SUM(points) AS points FROM pvp_points WHERE guild_id=? GROUP BY user_id", (guild.id,))}
+    user_ids = set(pve_scores) | set(pvp_scores)
+    if not user_ids:
+        return discord.Embed(title="PvE + PvP Leaderboard", description="No PvE or PvP points have been recorded yet.", colour=discord.Colour.gold())
+    ranking = sorted(user_ids, key=lambda user_id: (pve_scores.get(user_id, 0) + pvp_scores.get(user_id, 0), pvp_scores.get(user_id, 0), pve_scores.get(user_id, 0)), reverse=True)[:10]
+    lines = [f"**{place}.** <@{user_id}> — PvE: **{pve_scores.get(user_id, 0)}** | PvP: **{pvp_scores.get(user_id, 0)}**" for place, user_id in enumerate(ranking, 1)]
+    embed = discord.Embed(title="PvE + PvP Leaderboard", description="\n".join(lines), colour=discord.Colour.gold())
+    embed.set_footer(text="PvE points come from completed carries; PvP points come from completed ganks.")
+    return embed
+
+
+async def update_leaderboard(guild: discord.Guild):
+    leaderboard_channel = channel(guild, "leaderboard")
+    if not leaderboard_channel:
+        return
+    saved = store.db.execute("SELECT * FROM leaderboard_messages WHERE guild_id=?", (guild.id,)).fetchone()
+    message = None
+    if saved and saved["channel_id"] == leaderboard_channel.id:
+        try:
+            message = await leaderboard_channel.fetch_message(saved["message_id"])
+        except discord.HTTPException:
+            pass
+    if message:
+        await message.edit(embed=leaderboard_embed(guild))
+    else:
+        message = await leaderboard_channel.send(embed=leaderboard_embed(guild))
+        store.db.execute("INSERT OR REPLACE INTO leaderboard_messages VALUES(?,?,?)", (guild.id, leaderboard_channel.id, message.id))
+        store.db.commit()
+
+
+@bot.tree.command(description="Show the combined PvE and PvP leaderboard.")
+async def leaderboard(interaction: discord.Interaction):
+    embed = leaderboard_embed(interaction.guild)
+    if not set(row["user_id"] for row in store.db.execute("SELECT user_id FROM pve_points WHERE guild_id=? UNION SELECT user_id FROM pvp_points WHERE guild_id=?", (interaction.guild.id, interaction.guild.id))):
+        return await interaction.response.send_message("No PvE or PvP points have been recorded yet.", ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 def ids(value): return [int(item) for item in value.split(",") if item]
 def carry_embed(row):
@@ -657,11 +700,15 @@ async def endcarry(interaction: discord.Interaction):
         if carry_role:
             try: await carry_role.delete(reason="Carry ended")
             except discord.HTTPException: pass
+    participants = ids(row["joined"])
+    for user_id in participants:
+        store.db.execute("INSERT INTO pve_points(guild_id,user_id,points) VALUES(?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET points=points+1", (interaction.guild.id, user_id))
     store.db.execute("DELETE FROM carries WHERE message_id=?", (row["message_id"],)); store.db.commit()
     logs = channel(interaction.guild, "bot-logs")
     if logs:
         await logs.send(embed=discord.Embed(title="Carry ended", description=f"**{row['boss']}** ({row['region']}) ended by {interaction.user.mention}.", colour=discord.Colour.red()))
-    await interaction.response.send_message("Your carry has been ended.", ephemeral=True)
+    await update_leaderboard(interaction.guild)
+    await interaction.response.send_message(f"Your carry has been ended. {len(participants)} participant(s) received 1 PvE point.", ephemeral=True)
 
 
 class IncidentModal(discord.ui.Modal, title="Incident Report"):
@@ -754,11 +801,11 @@ async def close(interaction: discord.Interaction, ticket_id: str | None = None):
         await ticket_channel.delete(reason=f"Ticket {ticket['ticket_id']} closed by {interaction.user}")
 
 def select_giveaway_winners(guild: discord.Guild, entrants: list[int], count: int) -> list[int]:
-    """PvPer of the Month has three chances in every drawing, but can win only once."""
-    pvp_role = role(guild, "PvPer of the Month")
+    """Both monthly award roles have three chances, but may win only once."""
+    award_roles = [role(guild, "PvPer of the Month"), role(guild, "Hoster of the Month")]
     pool, winners = list(dict.fromkeys(entrants)), []
     while pool and len(winners) < count:
-        weights = [3 if pvp_role and (member := guild.get_member(user_id)) and pvp_role in member.roles else 1 for user_id in pool]
+        weights = [3 if (member := guild.get_member(user_id)) and any(award_role and award_role in member.roles for award_role in award_roles) else 1 for user_id in pool]
         winner = random.choices(pool, weights=weights, k=1)[0]
         pool.remove(winner)
         winners.append(winner)
@@ -794,6 +841,12 @@ async def award_previous_month(guild: discord.Guild):
         pvp_text = f"<@{pvp['user_id']}>" if pvp else "No winner"
         host_text = f"<@{host['host_id']}>" if host else "No winner"
         await updates.send(embed=discord.Embed(title=f"{period} monthly awards", description=f"PvPer of the Month: {pvp_text}\nHoster of the Month: {host_text}", colour=discord.Colour.gold()))
+
+
+@tasks.loop(seconds=60)
+async def leaderboard_updater():
+    for guild in filter(is_primary_guild, bot.guilds):
+        await update_leaderboard(guild)
 
 
 @tasks.loop(seconds=10)
@@ -853,6 +906,7 @@ async def on_ready():
             store.db.execute("INSERT INTO configured_guilds VALUES(?,?)", (guild.id, int(time.time())))
     store.db.commit()
     if not cleanup.is_running(): cleanup.start()
+    if not leaderboard_updater.is_running(): leaderboard_updater.start()
     # This bot uses global application commands.  Earlier versions copied the
     # same commands into every guild as well, so Discord displayed each command
     # twice (once globally and once as a guild command).  Clear those legacy
